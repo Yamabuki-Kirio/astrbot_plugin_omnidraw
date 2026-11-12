@@ -2001,6 +2001,14 @@ class OmniDrawPlugin(Star):
                 await session_obj.close()
         return processed_paths
 
+    async def _get_event_reference_images(self, event: AstrMessageEvent, **kwargs: Any) -> List[str]:
+        """Combine ordinary references with images inside OneBot forwarded records."""
+        from .core.forward_refs import collect_forward_images
+
+        images = list(self._get_event_images(event, **kwargs))
+        images.extend(await collect_forward_images(event))
+        return list(dict.fromkeys(images))[:14]
+
     def _normalize_count(self, count: Any) -> int:
         try:
             parsed_count = int(float(str(count).strip()))
@@ -3059,7 +3067,7 @@ class OmniDrawPlugin(Star):
                     self._as_plugin_image_refs(refs)
                     if refs is not None
                     else (
-                        self._get_event_images(event, include_at_avatars=True)
+                        await self._get_event_reference_images(event, include_at_avatars=True)
                         if event is not None
                         else []
                     )
@@ -3135,7 +3143,7 @@ class OmniDrawPlugin(Star):
                     self._as_plugin_image_refs(refs)
                     if refs is not None
                     else (
-                        self._get_event_images(event, include_at_avatars=True)
+                        await self._get_event_reference_images(event, include_at_avatars=True)
                         if event is not None
                         else []
                     )
@@ -3709,7 +3717,7 @@ class OmniDrawPlugin(Star):
         try:
             started_at = time.perf_counter()
             async with aiohttp.ClientSession() as session:
-                raw_refs = self._get_event_images(event, include_at_avatars=True, at_after_command=cmd_name)
+                raw_refs = await self._get_event_reference_images(event, include_at_avatars=True, at_after_command=cmd_name)
                 preset_prompt = self.plugin_config.presets[cmd_name]
                 safe_refs = await self._process_and_save_images(raw_refs, session=session)
                 base_prompt, kwargs = self.cmd_parser.parse(preset_prompt)
@@ -3819,7 +3827,7 @@ class OmniDrawPlugin(Star):
             return
 
         message = self._extract_command_message(event, command, fallback)
-        raw_refs = self._get_event_images(event, include_at_avatars=True, at_after_command=command)
+        raw_refs = await self._get_event_reference_images(event, include_at_avatars=True, at_after_command=command)
         if not message and not raw_refs:
             self._release_image_quota(event, reserved_count)
             yield event.plain_result(f"{MessageEmoji.WARNING} 请输入提示词或附带参考图。")
@@ -3918,7 +3926,7 @@ class OmniDrawPlugin(Star):
                 )
                 extra_kwargs.update(kwargs)
 
-                raw_refs = self._get_event_images(event)
+                raw_refs = await self._get_event_reference_images(event)
                 target_refs = raw_refs if raw_refs else self.plugin_config.persona_ref_images
                 safe_refs = await self._process_and_save_images(target_refs, session=session)
                 if safe_refs:
@@ -3985,7 +3993,7 @@ class OmniDrawPlugin(Star):
 
         fallback = " ".join(str(item) for item in [p1, p2, p3, p4, p5, p6, p7, p8, p9, p10] if item).strip()
         message = self._extract_command_message(event, "视频", fallback)
-        raw_refs = self._get_event_images(event)
+        raw_refs = await self._get_event_reference_images(event)
         if not message and not raw_refs:
             yield event.plain_result(f"{MessageEmoji.WARNING} 请输入视频提示词或附带参考图。")
             return
@@ -4068,7 +4076,7 @@ class OmniDrawPlugin(Star):
                     aspect_ratio=aspect_ratio,
                     size=size,
                     extra_params=extra_params,
-                    refs=refs if explicit_refs else self._get_event_images(event),
+                    refs=refs if explicit_refs else await self._get_event_reference_images(event),
                     mode="selfie",
                     event=event,
                     record_usage=True,
@@ -4167,7 +4175,7 @@ class OmniDrawPlugin(Star):
                     aspect_ratio=aspect_ratio,
                     size=size,
                     extra_params=extra_params,
-                    refs=refs if explicit_refs else self._get_event_images(event),
+                    refs=refs if explicit_refs else await self._get_event_reference_images(event),
                     event=event,
                     record_usage=True,
                     allow_local_refs=not explicit_refs,
@@ -4240,7 +4248,7 @@ class OmniDrawPlugin(Star):
 
         try:
             count = self._normalize_count(count)
-            raw_refs = self._get_event_images(event)
+            raw_refs = await self._get_event_reference_images(event)
             safe_refs = []
             if raw_refs:
                 needs_session = any(str(ref).startswith("http") for ref in raw_refs)

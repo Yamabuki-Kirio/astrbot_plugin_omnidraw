@@ -1,3 +1,8 @@
+> 本仓库为 [diaomin66/astrbot_plugin_omnidraw](https://github.com/diaomin66/astrbot_plugin_omnidraw) 的二开版本，保留原作者署名。
+> 新增 OneBot 合并转发聊天记录参考图提取：引用合并转发后发送 `/画 提示词`，支持嵌套转发。
+> 适用于支持 `get_msg`、`get_forward_msg` 的 OneBot 客户端；SnowLuma 尚待实机验证。最多提取 14 张图片，解析总超时 20 秒。
+> 开发验证：239 项自动测试通过。
+
 # AstrBot 万象画卷 OmniDraw
 
 当前版本：**3.4.1** · [更新日志](CHANGELOG.md#341)
