@@ -2,7 +2,7 @@
 
 # AstrBot 万象画卷 OmniDraw
 
-当前版本：**3.4.2** · [下载 Release](https://github.com/Yamabuki-Kirio/astrbot_plugin_omnidraw/releases/tag/v3.4.2) · [更新日志](CHANGELOG.md#342)
+当前版本：**3.4.3** · [下载 Release](https://github.com/Yamabuki-Kirio/astrbot_plugin_omnidraw/releases/tag/v3.4.3) · [更新日志](CHANGELOG.md#343)
 
 `astrbot_plugin_omnidraw` 是一个面向 AstrBot 的生图、改图、人设自拍和视频生成插件。你可以把它理解成一个“画图工作台”：配置好模型接口后，在群聊或私聊里发送指令，就能让机器人帮你画图、参考图片改图、按固定人设自拍，或者提交视频生成任务。
 
@@ -399,6 +399,8 @@ Web API 返回同样的 JSON 结构。自拍模式可传 `{"mode": "selfie", "ac
 ```
 
 插件会自动识别你发的图片，把它作为参考图传给画图模型。
+
+使用 OpenAI 标准改图接口时，GIF 参考图会取首帧并以 PNG 上传，原图和已保存的词条不变。这只影响参考图输入，不改变 `/gif` 的动图输出或其他节点的上传行为。
 
 ### QQ 群聊的头像与参考词条
 
