@@ -8,7 +8,7 @@ from typing import Any
 from astrbot.api import logger
 
 
-async def collect_forward_images(event: Any) -> list[str]:
+async def collect_forward_images(event: Any, *, strict: bool = False) -> list[str]:
     bot = getattr(event, "bot", None)
     call = getattr(bot, "call_action", None)
     if not callable(call):
@@ -20,22 +20,31 @@ async def collect_forward_images(event: Any) -> list[str]:
     retained: list[Any] = []
     fetched: set[tuple[str, str]] = set()
     remaining = 2000
+    limit = 15 if strict else 14
 
     async def fetch(action: str, key: str, value: Any, depth: int) -> None:
         token = (action, str(value))
-        if not callable(call) or not value or token in fetched or len(fetched) >= 12:
+        if not value or token in fetched:
+            return
+        if not callable(call) or len(fetched) >= 12:
+            if strict:
+                raise ValueError("无法完整读取引用或合并转发，原词条未修改")
             return
         fetched.add(token)
         try:
             result = await asyncio.wait_for(call(action, **{key: value}), timeout=8)
             await walk(result, depth + 1)
         except Exception as exc:
+            if strict:
+                raise ValueError("无法完整读取引用或合并转发，原词条未修改") from exc
             # A failed record must not discard directly attached reference images.
             logger.warning(f"[OmniDraw] 读取引用/合并转发失败 ({action}, {type(exc).__name__})")
 
     async def walk(obj: Any, depth: int = 0) -> None:
         nonlocal remaining
-        if obj is None or depth > 24 or remaining <= 0 or len(images) >= 14:
+        if strict and (depth > 24 or remaining <= 0):
+            raise ValueError("聊天记录过大，无法完整保存参考图")
+        if obj is None or depth > 24 or remaining <= 0 or len(images) >= limit:
             return
         remaining -= 1
         if isinstance(obj, str):
@@ -71,10 +80,13 @@ async def collect_forward_images(event: Any) -> list[str]:
                     images.append(ref)
             return
         if kind in {"forward", "reply"}:
+            if kind == "reply" and data.get("chain"):
+                await walk(data["chain"], depth + 1)
+                return
             await fetch(
                 "get_forward_msg" if kind == "forward" else "get_msg",
                 "id" if kind == "forward" else "message_id",
-                data.get("id") or data.get("message_id"),
+                data.get("id") or data.get("message_id") or data.get("res_id"),
                 depth,
             )
         # Traverse only message-bearing fields, never the bot/context object graph.
@@ -86,5 +98,7 @@ async def collect_forward_images(event: Any) -> list[str]:
     try:
         await asyncio.wait_for(walk(getattr(event, "message_obj", None)), timeout=20)
     except asyncio.TimeoutError:
+        if strict:
+            raise ValueError("读取聊天记录超时，原词条未修改") from None
         logger.warning("[OmniDraw] 合并转发解析超时，使用已提取的参考图")
     return images

@@ -41,6 +41,9 @@
                 <button class="nav-item" data-target="tab-presets" type="button">
                     <span class="nav-icon" aria-hidden="true"></span><span>快捷指令</span>
                 </button>
+                <button class="nav-item" data-target="tab-reference-terms" type="button">
+                    <span class="nav-icon" aria-hidden="true"></span><span>参考图词条</span>
+                </button>
                 <div class="nav-label">连接</div>
                 <button class="nav-item" data-target="tab-nodes" type="button">
                     <span class="nav-icon" aria-hidden="true"></span><span>接口节点</span>
@@ -457,6 +460,17 @@
                 </article>
             </section>
 
+            <section id="tab-reference-terms" class="tab-pane" data-title="参考图词条">
+                <article class="card wide-card">
+                    <div class="card-header space-between">
+                        <div><h3>参考图词条</h3><p>查看聊天中保存的词条。删除后，该词条不再自动附带参考图。</p></div>
+                        <button id="reference-terms-refresh" class="btn-secondary" type="button">刷新</button>
+                    </div>
+                    <p id="reference-terms-status" role="status"></p>
+                    <div id="reference-terms-list" class="list-container"></div>
+                </article>
+            </section>
+
             <section id="tab-nodes" class="tab-pane" data-title="接口节点">
                 <button class="btn-secondary gif-help-trigger" data-action="show-gif-help" type="button">GPT Image 2.6 · GIF 使用说明</button>
                 <article class="card wide-card">
@@ -486,6 +500,6 @@
 
     <noscript><div class="noscript-banner">配置页需要启用 JavaScript 才能运行。</div></noscript>
     <script defer src="./assets/ui.js?v=3.4.1-scoped-ui"></script>
-    <script type="module" src="./app.js?v=3.4.1-scoped-ui"></script>
+    <script type="module" src="./app.js?v=3.4.1-reference-terms"></script>
 </body>
 </html>

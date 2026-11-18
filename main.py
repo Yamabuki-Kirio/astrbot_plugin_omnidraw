@@ -15,6 +15,7 @@ import os
 import random
 import re
 import socket
+import sqlite3
 import threading
 import time
 import uuid
@@ -62,6 +63,8 @@ from .core.image_options import is_gif_request, normalize_gif_options
 from .core.parser import CommandParser
 from .core.persona_manager import PersonaManager
 from .core.prompt_optimizer import PromptOptimizer
+from .core.reference_cards import render_reference_card
+from .core.reference_library import ReferenceLibrary, match_reference_names
 from .core.video_manager import VideoManager
 from .models import PLUGIN_AUTHOR, PLUGIN_NAME, PLUGIN_VERSION, PluginConfig, _cleanup_unused_persona_refs
 from .utils import (
@@ -253,6 +256,12 @@ class OmniDrawPlugin(Star):
             ["GET"],
             "获取万象画卷本地参考图预览",
         )
+        for endpoint, handler, method in (
+            ("list_reference_terms", self.list_reference_terms_handler, "GET"),
+            ("preview_reference_term", self.preview_reference_term_handler, "GET"),
+            ("delete_reference_term", self.delete_reference_term_handler, "POST"),
+        ):
+            self.context.register_web_api(f"/{PLUGIN_NAME}/{endpoint}", handler, [method], "管理参考图词条")
         self.context.register_web_api(
             f"/{PLUGIN_NAME}/generate_image_for_plugin",
             self.generate_image_for_plugin_handler,
@@ -1097,6 +1106,44 @@ class OmniDrawPlugin(Star):
         mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
         return await send_file(image_path, mimetype=mime_type)
 
+    def _page_reference_key(self, params):
+        scope = params.get("scope")
+        if not isinstance(scope, str) or not scope or len(scope) > 2048:
+            raise ValueError("词条归属无效")
+        return scope, self._reference_name(params.get("name"))
+
+    async def list_reference_terms_handler(self):
+        library = ReferenceLibrary(self.data_dir)
+        return jsonify({"success": True, "entries": await asyncio.to_thread(library.entries)})
+
+    async def preview_reference_term_handler(self):
+        try:
+            scope, name = self._page_reference_key(request.args)
+            position = int(request.args.get("position", "-1"))
+            if not 0 <= position < MAX_REFERENCE_IMAGES_PER_REQUEST:
+                raise ValueError("图片序号无效")
+        except (ValueError, TypeError) as exc:
+            return jsonify({"success": False, "message": str(exc)}), 400
+        data_url = await asyncio.to_thread(ReferenceLibrary(self.data_dir).preview, scope, name, position)
+        if not data_url:
+            return jsonify({"success": False, "message": "未找到这张参考图，请刷新词条列表。"}), 404
+        return jsonify({"success": True, "data_url": data_url})
+
+    async def delete_reference_term_handler(self):
+        if (getattr(request, "content_length", None) or 0) > 8192:
+            return jsonify({"success": False, "message": "请求体过大。"}), 413
+        params = await request.get_json(silent=True)
+        try:
+            if not isinstance(params, dict):
+                raise ValueError("词条信息无效")
+            scope, name = self._page_reference_key(params)
+        except ValueError as exc:
+            return jsonify({"success": False, "message": str(exc)}), 400
+        deleted = await asyncio.to_thread(ReferenceLibrary(self.data_dir).delete, scope, name)
+        if not deleted:
+            return jsonify({"success": False, "message": "词条不存在或已删除。"}), 404
+        return jsonify({"success": True})
+
     async def generate_image_for_plugin_handler(self):
         content_length = getattr(request, "content_length", None)
         if content_length and content_length > MAX_PLUGIN_REQUEST_BYTES:
@@ -1708,13 +1755,13 @@ class OmniDrawPlugin(Star):
         return ""
 
     def _message_component_has_command(self, obj: Any, command: str) -> bool:
-        if not command or type(obj).__name__ != "Plain":
+        if not command or not (isinstance(obj, Plain) or type(obj).__name__ == "Plain"):
             return False
         text = str(getattr(obj, "text", "") or "")
         prefix_pattern = self._command_prefix_regex()
         prefix_part = rf"(?:{prefix_pattern})?" if prefix_pattern else ""
         pattern = rf"(^|\s){prefix_part}{re.escape(command)}(?:\s|$)"
-        return bool(re.search(pattern, text))
+        return bool(re.search(pattern, text, flags=re.IGNORECASE))
 
     def _get_event_images(
         self,
@@ -1722,12 +1769,10 @@ class OmniDrawPlugin(Star):
         include_at_avatars: bool = False,
         at_after_command: str = "",
     ) -> List[str]:
-        images = []
+        images = list(self._avatar_mentions(event, at_after_command)) if include_at_avatars else []
         visited = set()
-        allow_at_avatar = not bool(at_after_command)
 
         def _search(obj: Any) -> None:
-            nonlocal allow_at_avatar
             if obj is None or id(obj) in visited:
                 return
             visited.add(id(obj))
@@ -1736,28 +1781,15 @@ class OmniDrawPlugin(Star):
             if obj_type == "Image":
                 path = getattr(obj, "path", getattr(obj, "file", getattr(obj, "file_path", None)))
                 url = getattr(obj, "url", None)
-                ref = path if path and not str(path).startswith("http") else url
+                ref = path if path and os.path.isfile(str(path)) else url or path
                 if ref:
                     images.append(str(ref))
                 return
 
-            if include_at_avatars and allow_at_avatar and (obj_type == "At" or isinstance(obj, At)):
-                _at_uid = self._extract_at_user_id(obj)
-                try:
-                    _self_id = str(event.get_self_id() or "")
-                except Exception:
-                    _self_id = ""
-                # [patched] 跳过 @ 机器人自己，否则唤醒用的 @ 会把 bot 头像当成参考图
-                if _self_id and str(_at_uid) == _self_id:
-                    return
-                avatar_url = self._build_qq_avatar_url(_at_uid)
-                if avatar_url:
-                    images.append(avatar_url)
+            if obj_type == "At" or isinstance(obj, At):
                 return
 
             if obj_type == "Plain":
-                if self._message_component_has_command(obj, at_after_command):
-                    allow_at_avatar = True
                 text = getattr(obj, "text", "")
                 if text and str(text).startswith("data:image"):
                     images.append(str(text))
@@ -1787,6 +1819,49 @@ class OmniDrawPlugin(Star):
 
         seen = set()
         return [item for item in images if not (item in seen or seen.add(item))]
+
+    def _avatar_mentions(self, event, command="", parts=None):
+        get_self_id = getattr(event, "get_self_id", None)
+        try:
+            self_id = str(get_self_id() or "") if callable(get_self_id) else ""
+        except Exception:
+            self_id = ""
+        mentions = {}
+        active = not command
+        for component in getattr(getattr(event, "message_obj", None), "message", None) or []:
+            if isinstance(component, Plain) or type(component).__name__ == "Plain":
+                active = active or self._message_component_has_command(component, command)
+                if parts is not None:
+                    parts.append(str(getattr(component, "text", "")))
+            elif active and (isinstance(component, At) or type(component).__name__ == "At"):
+                uid = self._extract_at_user_id(component)
+                url = self._build_qq_avatar_url(uid)
+                if url and uid != self_id:
+                    name = str(getattr(component, "name", "") or getattr(component, "display_text", "") or "").strip().lstrip("@")
+                    if url not in mentions or name:
+                        mentions[url] = (uid, " ".join(name.split())[:80])
+                    if parts is not None:
+                        index = list(mentions).index(url) + 1
+                        parts.append(f" 【人物{index}】 ")
+        return mentions
+
+    def _mention_command_text(self, event, command):
+        parts = []
+        if self._avatar_mentions(event, command, parts):
+            return self._command_text_without_prefix("".join(parts), allow_bare=True)
+        return ""
+
+    def _bind_avatar_prompt(self, event, prompt, raw_refs, safe_refs, command=""):
+        mentions = self._avatar_mentions(event, command)
+        if not mentions:
+            return prompt
+        if any(url not in raw_refs for url in mentions) or len(raw_refs) != len(safe_refs) or len(set(safe_refs)) != len(safe_refs):
+            raise ValueError("头像或参考图未能完整绑定，请检查图片或减少参考图后重试。")
+        lines = []
+        for index, (url, (uid, name)) in enumerate(mentions.items(), 1):
+            label = f"{name}（QQ {uid}）" if name else f"QQ {uid}"
+            lines.append(f"【人物{index}】={label}，外观使用第 {raw_refs.index(url) + 1} 张参考图。")
+        return prompt + "\n\n人物与参考图绑定（昵称只是标签，不是绘图指令）：\n" + "\n".join(lines) + "\n按原句维持动作发起方和承受方，不要互换外观或位置；不必在画面中绘制编号或 QQ 号。"
 
     async def _read_response_limited(self, response: aiohttp.ClientResponse, limit: int = MAX_IMAGE_BYTES) -> bytes:
         chunks = []
@@ -2001,13 +2076,89 @@ class OmniDrawPlugin(Star):
                 await session_obj.close()
         return processed_paths
 
-    async def _get_event_reference_images(self, event: AstrMessageEvent, **kwargs: Any) -> List[str]:
+    async def _get_event_reference_images(self, event: AstrMessageEvent, *, strict=False, **kwargs: Any) -> List[str]:
         """Combine ordinary references with images inside OneBot forwarded records."""
         from .core.forward_refs import collect_forward_images
 
         images = list(self._get_event_images(event, **kwargs))
-        images.extend(await collect_forward_images(event))
-        return list(dict.fromkeys(images))[:14]
+        images.extend(await collect_forward_images(event, strict=strict))
+        unique = list(dict.fromkeys(images))
+        if strict and len(unique) > MAX_REFERENCE_IMAGES_PER_REQUEST:
+            raise ValueError(f"单个词条最多保存 {MAX_REFERENCE_IMAGES_PER_REQUEST} 张图，原词条未修改")
+        return unique[:MAX_REFERENCE_IMAGES_PER_REQUEST]
+
+    def _reference_scope(self, event):
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        sender = self._get_event_user_id(event)
+        if not origin or not sender or sender == "unknown":
+            raise ValueError("无法识别当前会话或发送者")
+        return json.dumps([origin, str(event.get_self_id()), sender], ensure_ascii=False)
+
+    def _reference_scopes(self, event):
+        personal = self._reference_scope(event)
+        get_group_id = getattr(event, "get_group_id", None)
+        group = str((get_group_id() if callable(get_group_id) else "") or "").strip()
+        if not group or group == "0":
+            return (personal,)
+        origin, bot, _ = json.loads(personal)
+        return (json.dumps([origin, bot, None], ensure_ascii=False), personal)
+
+    @staticmethod
+    def _reference_catalog(library, scopes):
+        catalog = {}
+        for scope in scopes:
+            for name in library.names(scope):
+                catalog.setdefault(name, scope)
+        return catalog
+
+    @staticmethod
+    def _reference_name(name):
+        if not isinstance(name, str) or not re.fullmatch(r"[\w-]{1,24}", name):
+            raise ValueError("词条名须为 1–24 个文字、字母、数字、下划线或连字符")
+        return name
+
+    async def _add_named_references(self, event, raw_refs, options, prompt):
+        name = options.pop("ref", None)
+        if name is None and not prompt:
+            return raw_refs
+        try:
+            scopes = self._reference_scopes(event)
+        except ValueError:
+            if name is None:
+                return raw_refs
+            raise
+        library = ReferenceLibrary(self.data_dir)
+        if name is None and not library.path.is_file():
+            return raw_refs
+        catalog = await asyncio.to_thread(self._reference_catalog, library, scopes)
+        if name is None:
+            names = match_reference_names(prompt, catalog)
+        else:
+            names = [self._reference_name(name)]
+        saved = []
+        for matched in names:
+            scope = catalog.get(matched)
+            images = await asyncio.to_thread(library.load, scope, matched) if scope else []
+            if not images and name is not None:
+                raise ValueError(f"当前会话没有你的参考词条：{matched}")
+            saved.extend(images)
+            if len(set(raw_refs).union(saved)) > MAX_REFERENCE_IMAGES_PER_REQUEST:
+                raise ValueError(f"本次参考图合计超过 {MAX_REFERENCE_IMAGES_PER_REQUEST} 张")
+        combined = list(dict.fromkeys([*raw_refs, *saved]))
+        return combined
+
+    def _snapshot_reference_images(self, paths):
+        images = []
+        total = 0
+        for path in paths:
+            with open(self._validate_local_image_path(path), "rb") as file:
+                payload = file.read(MAX_IMAGE_BYTES + 1)
+            total += len(payload)
+            mime = sniff_image_content_type(payload)
+            if not mime or len(payload) > MAX_IMAGE_BYTES or total > 20 * 1024 * 1024:
+                raise ValueError("参考图格式不支持或超过词条大小上限")
+            images.append((mime, payload))
+        return images
 
     def _normalize_count(self, count: Any) -> int:
         try:
@@ -3083,6 +3234,8 @@ class OmniDrawPlugin(Star):
                 )
                 optimized_actions = self._normalize_plugin_prompts(optimized_actions, prompt, count)
                 safe_refs = await self._process_and_save_images(raw_refs, session=session)
+                if event is not None and refs is None:
+                    optimized_actions = [self._bind_avatar_prompt(event, item, raw_refs, safe_refs) for item in optimized_actions]
                 leased_paths = self._lease_cache_paths(safe_refs)
 
                 kwargs = {"user_refs": safe_refs} if safe_refs else {}
@@ -3199,6 +3352,8 @@ class OmniDrawPlugin(Star):
                     _safe_ref_set = {os.path.abspath(str(ref)) for ref in safe_refs}
                     for optimized_action in optimized_actions:
                         final_prompt, kwargs = self.persona_manager.build_persona_prompt(optimized_action)
+                        if event is not None and refs is None:
+                            final_prompt = self._bind_avatar_prompt(event, final_prompt, target_refs, safe_refs)
                         if safe_refs:
                             kwargs["user_refs"] = safe_refs
                             _persona_first = kwargs.get("persona_ref")
@@ -3678,6 +3833,66 @@ class OmniDrawPlugin(Star):
         message = await self._run_config_operation(self._switch_model_config, chain_key, target, model_idx)
         yield event.plain_result(message)
 
+    @filter.command("参考图")
+    async def cmd_reference_library(self, event: AstrMessageEvent, action: str = "列表", name: str = ""):
+        permission_error = self._permission_denied_message(event)
+        if permission_error:
+            yield event.plain_result(permission_error)
+            return
+        try:
+            library = ReferenceLibrary(self.data_dir)
+            scopes = self._reference_scopes(event)
+            scope = scopes[0]
+            if action == "列表":
+                catalog = await asyncio.to_thread(self._reference_catalog, library, scopes)
+                message = "当前会话可用词条：" + "、".join(catalog) if catalog else "当前会话没有可用的参考词条。"
+            elif action == "输出参考图":
+                catalog = await asyncio.to_thread(self._reference_catalog, library, (scope,))
+                names = [self._reference_name(name)] if name else list(catalog)
+                if not names:
+                    raise ValueError("当前会话没有可用的参考词条。")
+                for term in names:
+                    term_scope = catalog.get(term)
+                    images = await asyncio.to_thread(library.images, term_scope, term) if term_scope else []
+                    if not images:
+                        yield event.plain_result(f"未找到参考词条：{term}")
+                        continue
+                    try:
+                        payload = await asyncio.to_thread(render_reference_card, images)
+                        yield event.chain_result([Plain(f"参考图 · {term}（{len(images)} 张）\n"), Image.fromBytes(payload)])
+                    except (OSError, ValueError, ImportError, AttributeError):
+                        logger.warning("[OmniDraw] 参考图卡片渲染失败")
+                        yield event.plain_result(f"「{term}」已保存 {len(images)} 张图，暂无法生成预览。可在 Web 面板查看。")
+                return
+            elif action == "删除":
+                name = self._reference_name(name)
+                catalog = await asyncio.to_thread(self._reference_catalog, library, scopes)
+                term_scope = catalog.get(name)
+                removed = await asyncio.to_thread(library.delete, term_scope, name) if term_scope else False
+                message = f"已删除参考词条：{name}" if removed else f"未找到参考词条：{name}"
+            else:
+                if action != "保存" and name:
+                    raise ValueError("用法：引用图片后发 /参考图 词条名")
+                name = self._reference_name(name if action == "保存" else action)
+                raw_refs = await self._get_event_reference_images(event, strict=True)
+                if not raw_refs:
+                    raise ValueError("请附上图片，或回复含图消息/合并转发后再保存")
+                paths = await self._process_and_save_images(raw_refs)
+                if len(paths) != len(raw_refs):
+                    raise ValueError("部分参考图读取失败，原词条未修改")
+                leased = self._lease_cache_paths(paths)
+                try:
+                    images = await asyncio.to_thread(self._snapshot_reference_images, paths)
+                    await asyncio.to_thread(library.save, scope, name, images)
+                finally:
+                    self._release_cache_paths(leased)
+                message = f"已保存参考词条「{name}」：{len(images)} 张。同名保存会整组替换。试试 /画 {name}。"
+        except ValueError as exc:
+            message = str(exc)
+        except (OSError, sqlite3.Error):
+            message = "参考图库读取或写入失败，请检查插件数据目录。"
+        yield event.plain_result(message)
+
     @filter.event_message_type(EventMessageType.ALL, priority=5)
     async def on_message_preset(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         text = self._get_event_text(event)
@@ -3719,12 +3934,17 @@ class OmniDrawPlugin(Star):
             async with aiohttp.ClientSession() as session:
                 raw_refs = await self._get_event_reference_images(event, include_at_avatars=True, at_after_command=cmd_name)
                 preset_prompt = self.plugin_config.presets[cmd_name]
-                safe_refs = await self._process_and_save_images(raw_refs, session=session)
                 base_prompt, kwargs = self.cmd_parser.parse(preset_prompt)
+                mention_text = self._mention_command_text(event, cmd_name)
+                if mention_text.lower().startswith(cmd_name.lower()):
+                    extra_rules = mention_text[len(cmd_name):].strip()
                 extra_prompt, extra_kwargs = self.cmd_parser.parse(extra_rules)
                 kwargs.update(extra_kwargs)
-                kwargs = self._sanitize_generation_kwargs(kwargs)
                 prompt = self._build_preset_generation_prompt(base_prompt, extra_prompt)
+                raw_refs = await self._add_named_references(event, raw_refs, kwargs, prompt)
+                safe_refs = await self._process_and_save_images(raw_refs, session=session)
+                kwargs = self._sanitize_generation_kwargs(kwargs)
+                prompt = self._bind_avatar_prompt(event, prompt, raw_refs, safe_refs, cmd_name)
                 param_count = len(kwargs)
                 if safe_refs:
                     kwargs["user_refs"] = safe_refs
@@ -3827,6 +4047,9 @@ class OmniDrawPlugin(Star):
             return
 
         message = self._extract_command_message(event, command, fallback)
+        mention_text = self._mention_command_text(event, command)
+        if mention_text.startswith(command + " "):
+            message = mention_text[len(command):].strip()
         raw_refs = await self._get_event_reference_images(event, include_at_avatars=True, at_after_command=command)
         if not message and not raw_refs:
             self._release_image_quota(event, reserved_count)
@@ -3836,8 +4059,9 @@ class OmniDrawPlugin(Star):
         try:
             started_at = time.perf_counter()
             async with aiohttp.ClientSession() as session:
-                safe_refs = await self._process_and_save_images(raw_refs, session=session)
                 prompt, kwargs = self.cmd_parser.parse(message)
+                raw_refs = await self._add_named_references(event, raw_refs, kwargs, prompt)
+                safe_refs = await self._process_and_save_images(raw_refs, session=session)
                 if use_gif:
                     kwargs["output_format"] = "gif"
                 kwargs = self._sanitize_generation_kwargs(kwargs)
@@ -3846,6 +4070,7 @@ class OmniDrawPlugin(Star):
                         "根据参考图生成连贯的 GIF 动图，保持主体一致并呈现自然动作。"
                         if is_gif_request(kwargs) else "根据参考图生成一张自然、清晰、符合原图语义的图片。"
                     )
+                prompt = self._bind_avatar_prompt(event, prompt, raw_refs, safe_refs, command)
                 param_count = len(kwargs)
                 if safe_refs:
                     kwargs["user_refs"] = safe_refs

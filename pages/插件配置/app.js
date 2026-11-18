@@ -1289,6 +1289,7 @@ function setActiveTab(navItem) {
         notifyRender(targetPane);
     }
     notifyRender(navItem.parentElement);
+    if (targetId === "tab-reference-terms") void loadReferenceTerms();
     if (targetId === "tab-usage") {
         if (!usageLoaded) void loadUsageStats(false);
         if (!cacheLoaded) void loadCacheStats(false);
@@ -1301,10 +1302,108 @@ function setActiveTab(navItem) {
         "tab-hub": "为图像、自拍和视频选择主节点与有序备用链路。",
         "tab-optimizer": "设置提示词优化节点、风格与补充要求。",
         "tab-presets": "将常用提示词与参数保存为快捷指令。",
+        "tab-reference-terms": "查看和删除聊天中保存的参考图词条。",
         "tab-nodes": "管理接口、模型与密钥，保留所有原有调用方式。"
     };
     document.querySelector(".topbar-caption").textContent = descriptions[targetId] || "";
     navItem.scrollIntoView({ behavior: "instant", inline: "nearest", block: "nearest" });
+}
+
+function referenceTermButton(text, onClick, danger = false) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `btn-glass-secondary${danger ? " btn-danger" : ""}`;
+    button.textContent = text;
+    button.addEventListener("click", onClick);
+    return button;
+}
+
+function renderReferenceTerm(entry) {
+    const row = document.createElement("article");
+    row.className = "card";
+    const title = document.createElement("h4");
+    title.textContent = `${entry.name} · ${entry.count} 张`;
+    const owner = document.createElement("p");
+    try {
+        const [origin, bot, sender] = JSON.parse(entry.scope);
+        owner.textContent = `会话：${origin} ｜ Bot：${bot} ｜ ${sender === null ? "群共享" : `保存者：${sender}`}`;
+    } catch {
+        owner.textContent = entry.scope;
+    }
+    const actions = document.createElement("div");
+    const preview = document.createElement("div");
+    const status = document.createElement("p");
+    status.setAttribute("role", "status");
+    const confirmation = document.createElement("div");
+    confirmation.hidden = true;
+    const key = { scope: entry.scope, name: entry.name };
+    const previewButton = referenceTermButton("查看图片", () => {
+        preview.hidden = !preview.hidden;
+        previewButton.textContent = preview.hidden ? "查看图片" : "收起图片";
+        if (!preview.hidden && !preview.childElementCount) {
+            for (let position = 0; position < entry.count; position++) {
+                const pictureButton = referenceTermButton(`第 ${position + 1} 张`, async () => {
+                    pictureButton.disabled = true;
+                    try {
+                        const response = await bridge.apiGet("preview_reference_term", { ...key, position });
+                        if (!response?.success || !response.data_url?.startsWith("data:image/")) throw new Error(response?.message || "无法读取图片");
+                        const image = document.createElement("img");
+                        image.alt = `${entry.name} · 第 ${position + 1} 张参考图`;
+                        image.style.cssText = "display:block;max-width:100%;max-height:480px;margin-top:8px;object-fit:contain";
+                        image.src = response.data_url;
+                        preview.querySelector("img")?.remove();
+                        preview.append(image);
+                        status.textContent = "";
+                    } catch (error) {
+                        status.textContent = error.message || "图片预览失败";
+                    } finally {
+                        pictureButton.disabled = false;
+                    }
+                });
+                preview.append(pictureButton);
+            }
+            preview.firstElementChild?.click();
+        }
+    });
+    preview.hidden = true;
+    const deleteButton = referenceTermButton("删除词条", () => { confirmation.hidden = false; }, true);
+    const cancel = referenceTermButton("取消", () => { confirmation.hidden = true; });
+    const confirm = referenceTermButton("确认删除", async () => {
+        confirm.disabled = cancel.disabled = true;
+        try {
+            const response = await bridge.apiPost("delete_reference_term", key);
+            if (!response?.success) throw new Error(response?.message || "删除失败");
+            showToast(`已删除参考图词条「${entry.name}」`);
+            await loadReferenceTerms();
+        } catch (error) {
+            status.textContent = error.message || "删除失败";
+        } finally {
+            confirm.disabled = cancel.disabled = false;
+        }
+    }, true);
+    confirmation.append(`确定删除「${entry.name}」及其全部参考图？`, confirm, cancel);
+    actions.append(previewButton, deleteButton);
+    row.append(title, owner, actions, confirmation, preview, status);
+    return row;
+}
+
+async function loadReferenceTerms() {
+    const refresh = byId("reference-terms-refresh");
+    const status = byId("reference-terms-status");
+    const list = byId("reference-terms-list");
+    if (refresh.disabled) return;
+    refresh.disabled = true;
+    status.textContent = "正在加载词条…";
+    try {
+        const response = await bridge.apiGet("list_reference_terms");
+        if (!response?.success || !Array.isArray(response.entries)) throw new Error(response?.message || "无法读取词条列表");
+        list.replaceChildren(...response.entries.map(renderReferenceTerm));
+        status.textContent = response.entries.length ? `共 ${response.entries.length} 个词条` : "暂无已保存的参考图词条。";
+    } catch (error) {
+        status.textContent = error.message || "加载词条失败";
+    } finally {
+        refresh.disabled = false;
+    }
 }
 
 function animateAdd(containerId) {
@@ -1730,6 +1829,7 @@ async function loadPageConfig() {
 }
 
 async function init() {
+    byId("reference-terms-refresh")?.addEventListener("click", () => void loadReferenceTerms());
     const content = document.querySelector(".content");
     const pageStatus = byId("page-status");
     try {
