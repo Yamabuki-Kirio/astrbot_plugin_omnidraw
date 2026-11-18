@@ -12,6 +12,22 @@ main = importlib.import_module(f"{fixtures.PACKAGE_NAME}.main")
 
 
 class ReferenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_openai_edit_gif_reference_uses_first_frame(self):
+        from PIL import Image
+
+        provider = importlib.import_module(f"{fixtures.PACKAGE_NAME}.providers.openai_impl")
+        output = io.BytesIO()
+        Image.new("RGB", (8, 8), "red").save(
+            output, "GIF", save_all=True, append_images=[Image.new("RGB", (8, 8), "blue")],
+        )
+        refs = [(output.getvalue(), "image/gif"), (b"other", "image/jpeg")]
+        converted = provider.prepare_edit_references(refs)
+        self.assertEqual(converted[0][1], "image/png")
+        with Image.open(io.BytesIO(converted[0][0])) as first:
+            self.assertEqual(first.n_frames, 1)
+            self.assertEqual(first.getpixel((0, 0)), (255, 0, 0, 255))
+        self.assertEqual(converted[1], refs[1])
+
     async def test_group_replacement_and_preview_do_not_cross_groups(self):
         from PIL import Image
 

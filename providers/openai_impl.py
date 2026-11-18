@@ -1,3 +1,5 @@
+import asyncio
+import io
 import aiohttp
 import base64
 import json
@@ -9,6 +11,8 @@ from ..core.image_options import is_gif_request
 
 from .base import (
     BaseProvider,
+    MAX_REFERENCE_IMAGE_BYTES,
+    MAX_REFERENCE_TOTAL_BYTES,
     build_image_edits_endpoint,
     build_image_generations_endpoint,
     extract_error_message,
@@ -18,6 +22,30 @@ from .base import (
     summarize_response_text_for_log,
     validate_gif_result,
 )
+
+def prepare_edit_references(refs):
+    prepared = []
+    total = 0
+    for index, (payload, mime_type) in enumerate(refs, start=1):
+        if mime_type == "image/gif":
+            from PIL import Image
+
+            try:
+                with Image.open(io.BytesIO(payload)) as image:
+                    if image.width * image.height > 24_000_000:
+                        raise ValueError("GIF 像素过大")
+                    output = io.BytesIO()
+                    image.convert("RGBA").save(output, format="PNG")
+                    payload = output.getvalue()
+                mime_type = "image/png"
+            except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                raise ValueError(f"第 {index} 张 GIF 参考图无法转换为静态 PNG：{exc}") from exc
+        total += len(payload)
+        if len(payload) > MAX_REFERENCE_IMAGE_BYTES or total > MAX_REFERENCE_TOTAL_BYTES:
+            raise ValueError("转换后参考图超过大小上限")
+        prepared.append((payload, mime_type))
+    return prepared
+
 
 class OpenAIProvider(BaseProvider):
     async def generate_image(self, prompt: str, **kwargs: Any) -> str:
@@ -57,11 +85,13 @@ class OpenAIProvider(BaseProvider):
                     return await self._parse_response(response, base_url, gif_requested=gif_requested)
 
             data = aiohttp.FormData()
+            loaded_refs = await asyncio.to_thread(prepare_edit_references, loaded_refs)
             for idx, (image_bytes, mime_type) in enumerate(loaded_refs, start=1):
+                extension = {"image/jpeg": "jpg", "image/webp": "webp", "image/png": "png"}.get(mime_type, "bin")
                 data.add_field(
                     "image[]",
                     image_bytes,
-                    filename=f"reference_{idx}.png",
+                    filename=f"reference_{idx}.{extension}",
                     content_type=mime_type,
                 )
 
