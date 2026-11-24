@@ -2117,35 +2117,75 @@ class OmniDrawPlugin(Star):
             raise ValueError("词条名须为 1–24 个文字、字母、数字、下划线或连字符")
         return name
 
-    async def _add_named_references(self, event, raw_refs, options, prompt):
+    async def _add_named_references(self, event, raw_refs, options, prompt, *, return_bindings=False):
         name = options.pop("ref", None)
         if name is None and not prompt:
-            return raw_refs
+            return (raw_refs, []) if return_bindings else raw_refs
         try:
             scopes = self._reference_scopes(event)
         except ValueError:
             if name is None:
-                return raw_refs
+                return (raw_refs, []) if return_bindings else raw_refs
             raise
         library = ReferenceLibrary(self.data_dir)
         if name is None and not library.path.is_file():
-            return raw_refs
+            return (raw_refs, []) if return_bindings else raw_refs
         catalog = await asyncio.to_thread(self._reference_catalog, library, scopes)
         if name is None:
             names = match_reference_names(prompt, catalog)
         else:
             names = [self._reference_name(name)]
         saved = []
+        matched_images = []
         for matched in names:
             scope = catalog.get(matched)
             images = await asyncio.to_thread(library.load, scope, matched) if scope else []
             if not images and name is not None:
                 raise ValueError(f"当前会话没有你的参考词条：{matched}")
             saved.extend(images)
+            if images:
+                matched_images.append((matched, images))
             if len(set(raw_refs).union(saved)) > MAX_REFERENCE_IMAGES_PER_REQUEST:
                 raise ValueError(f"本次参考图合计超过 {MAX_REFERENCE_IMAGES_PER_REQUEST} 张")
         combined = list(dict.fromkeys([*raw_refs, *saved]))
-        return combined
+        if not return_bindings:
+            return combined
+        bindings = [
+            (matched, [combined.index(image) + 1 for image in images])
+            for matched, images in matched_images
+        ]
+        return combined, bindings
+
+    @staticmethod
+    def _bind_named_reference_prompt(prompt, bindings, raw_refs, safe_refs):
+        if not bindings:
+            return prompt
+        if len(raw_refs) != len(safe_refs) or len(set(safe_refs)) != len(safe_refs):
+            raise ValueError("参考图词条未能完整绑定，请检查图片或减少参考图后重试。")
+
+        labels = {name: f"【参考主体{index}】" for index, (name, _) in enumerate(bindings, 1)}
+        patterns = []
+        for name in sorted(labels, key=lambda item: (-len(item), item)):
+            escaped = re.escape(name)
+            if name[0].isascii():
+                escaped = r"(?<![A-Za-z0-9_])" + escaped
+            if name[-1].isascii():
+                escaped += r"(?![A-Za-z0-9_])"
+            patterns.append(escaped)
+        rewritten = re.sub("|".join(patterns), lambda match: labels[match.group()], prompt)
+
+        lines = []
+        for index, (name, positions) in enumerate(bindings, 1):
+            image_text = "、".join(f"第 {position} 张" for position in positions)
+            lines.append(f"【参考主体{index}】=参考图词条「{name}」，外观使用{image_text}参考图。")
+        return (
+            rewritten
+            + "\n\n参考图词条与原句角色绑定：\n"
+            + "\n".join(lines)
+            + "\n严格按改写后原句的语序和语义区分动作发起方与承受方；"
+              "同一编号在整段描述中始终代表同一主体，并保持‘被、由、让、把’等语法关系及代词指向；"
+              "不要交换任何参考主体的外观、动作、位置或角色关系；不必在画面中绘制编号。"
+        )
 
     def _snapshot_reference_images(self, paths):
         images = []
@@ -3941,9 +3981,12 @@ class OmniDrawPlugin(Star):
                 extra_prompt, extra_kwargs = self.cmd_parser.parse(extra_rules)
                 kwargs.update(extra_kwargs)
                 prompt = self._build_preset_generation_prompt(base_prompt, extra_prompt)
-                raw_refs = await self._add_named_references(event, raw_refs, kwargs, prompt)
+                raw_refs, named_bindings = await self._add_named_references(
+                    event, raw_refs, kwargs, prompt, return_bindings=True,
+                )
                 safe_refs = await self._process_and_save_images(raw_refs, session=session)
                 kwargs = self._sanitize_generation_kwargs(kwargs)
+                prompt = self._bind_named_reference_prompt(prompt, named_bindings, raw_refs, safe_refs)
                 prompt = self._bind_avatar_prompt(event, prompt, raw_refs, safe_refs, cmd_name)
                 param_count = len(kwargs)
                 if safe_refs:
@@ -4060,7 +4103,9 @@ class OmniDrawPlugin(Star):
             started_at = time.perf_counter()
             async with aiohttp.ClientSession() as session:
                 prompt, kwargs = self.cmd_parser.parse(message)
-                raw_refs = await self._add_named_references(event, raw_refs, kwargs, prompt)
+                raw_refs, named_bindings = await self._add_named_references(
+                    event, raw_refs, kwargs, prompt, return_bindings=True,
+                )
                 safe_refs = await self._process_and_save_images(raw_refs, session=session)
                 if use_gif:
                     kwargs["output_format"] = "gif"
@@ -4070,6 +4115,7 @@ class OmniDrawPlugin(Star):
                         "根据参考图生成连贯的 GIF 动图，保持主体一致并呈现自然动作。"
                         if is_gif_request(kwargs) else "根据参考图生成一张自然、清晰、符合原图语义的图片。"
                     )
+                prompt = self._bind_named_reference_prompt(prompt, named_bindings, raw_refs, safe_refs)
                 prompt = self._bind_avatar_prompt(event, prompt, raw_refs, safe_refs, command)
                 param_count = len(kwargs)
                 if safe_refs:

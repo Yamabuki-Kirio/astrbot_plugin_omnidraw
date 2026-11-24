@@ -94,6 +94,87 @@ class ReferenceTests(unittest.IsolatedAsyncioTestCase):
             event.get_sender_id = lambda: "other"
             self.assertEqual(await plugin._add_named_references(event, ["current.png"], {}, "塔菲"), ["current.png"])
 
+    async def test_named_references_bind_actor_and_target_to_image_order(self):
+        with tempfile.TemporaryDirectory() as root:
+            plugin = main.OmniDrawPlugin.__new__(main.OmniDrawPlugin)
+            plugin.data_dir = root
+            event = types.SimpleNamespace(
+                unified_msg_origin="qq:GroupMessage:123", get_self_id=lambda: "999", get_sender_id=lambda: "456",
+            )
+            library = main.ReferenceLibrary(root)
+            scope = plugin._reference_scope(event)
+            library.save(scope, "卡萝莉娜", [("image/png", b"actor")])
+            library.save(scope, "芮丝汀娜", [("image/png", b"target")])
+
+            raw_refs, bindings = await plugin._add_named_references(
+                event,
+                ["attached.png"],
+                {},
+                "卡萝莉娜推倒芮丝汀娜",
+                return_bindings=True,
+            )
+            self.assertEqual(
+                raw_refs,
+                ["attached.png", "data:image/png;base64,YWN0b3I=", "data:image/png;base64,dGFyZ2V0"],
+            )
+            self.assertEqual(bindings, [("卡萝莉娜", [2]), ("芮丝汀娜", [3])])
+            prompt = plugin._bind_named_reference_prompt(
+                "卡萝莉娜推倒芮丝汀娜", bindings, raw_refs, ["attached-safe.png", "actor.png", "target.png"],
+            )
+            self.assertIn("【参考主体1】推倒【参考主体2】", prompt)
+            self.assertIn("词条「卡萝莉娜」，外观使用第 2 张参考图", prompt)
+            self.assertIn("词条「芮丝汀娜」，外观使用第 3 张参考图", prompt)
+            self.assertIn("区分动作发起方与承受方", prompt)
+
+            reversed_refs, reversed_bindings = await plugin._add_named_references(
+                event, [], {}, "芮丝汀娜推倒卡萝莉娜", return_bindings=True,
+            )
+            self.assertEqual(reversed_bindings, [("芮丝汀娜", [1]), ("卡萝莉娜", [2])])
+            reversed_prompt = plugin._bind_named_reference_prompt(
+                "芮丝汀娜推倒卡萝莉娜", reversed_bindings, reversed_refs, ["target.png", "actor.png"],
+            )
+            self.assertIn("【参考主体1】推倒【参考主体2】", reversed_prompt)
+            self.assertIn("词条「芮丝汀娜」，外观使用第 1 张参考图", reversed_prompt)
+            self.assertIn("词条「卡萝莉娜」，外观使用第 2 张参考图", reversed_prompt)
+
+            with self.assertRaisesRegex(ValueError, "参考图词条未能完整绑定"):
+                plugin._bind_named_reference_prompt("卡萝莉娜推倒芮丝汀娜", bindings, raw_refs, ["actor.png"])
+
+    async def test_named_reference_roles_survive_complex_prompt_grammar(self):
+        with tempfile.TemporaryDirectory() as root:
+            plugin = main.OmniDrawPlugin.__new__(main.OmniDrawPlugin)
+            plugin.data_dir = root
+            event = types.SimpleNamespace(
+                unified_msg_origin="qq:GroupMessage:123", get_self_id=lambda: "999", get_sender_id=lambda: "456",
+            )
+            library = main.ReferenceLibrary(root)
+            scope = plugin._reference_scope(event)
+            library.save(scope, "卡萝莉娜", [("image/png", b"caroline")])
+            library.save(scope, "芮丝汀娜", [("image/png", b"justine")])
+
+            cases = {
+                "卡萝莉娜被芮丝汀娜推倒在沙发上": "【参考主体1】被【参考主体2】推倒在沙发上",
+                "卡萝莉娜抓住芮丝汀娜的手腕，芮丝汀娜转身推开卡萝莉娜": (
+                    "【参考主体1】抓住【参考主体2】的手腕，【参考主体2】转身推开【参考主体1】"
+                ),
+                "先让芮丝汀娜挡在门前，再由卡萝莉娜把芮丝汀娜拉开": (
+                    "先让【参考主体1】挡在门前，再由【参考主体2】把【参考主体1】拉开"
+                ),
+            }
+            for source, rewritten in cases.items():
+                with self.subTest(source=source):
+                    raw_refs, bindings = await plugin._add_named_references(
+                        event, ["scene.png"], {}, source, return_bindings=True,
+                    )
+                    prompt = plugin._bind_named_reference_prompt(
+                        source, bindings, raw_refs, [f"safe-{index}.png" for index in range(len(raw_refs))],
+                    )
+                    self.assertIn(rewritten, prompt)
+                    self.assertEqual(prompt.count("参考图词条「卡萝莉娜」"), 1)
+                    self.assertEqual(prompt.count("参考图词条「芮丝汀娜」"), 1)
+                    self.assertIn("同一编号在整段描述中始终代表同一主体", prompt)
+                    self.assertIn("保持‘被、由、让、把’等语法关系及代词指向", prompt)
+
     async def test_avatars_follow_message_roles_and_ignore_quoted_mentions(self):
         plugin_type = main.OmniDrawPlugin
         plugin = plugin_type.__new__(plugin_type)
