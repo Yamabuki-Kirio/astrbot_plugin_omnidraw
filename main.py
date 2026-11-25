@@ -214,6 +214,71 @@ def _extract_wake_prefixes(cfg: Any) -> List[str]:
     return [str(raw_prefixes)]
 
 
+def _extract_event_self_id(event: AstrMessageEvent) -> str:
+    getter = getattr(event, "get_self_id", None)
+    if callable(getter):
+        try:
+            value = getter()
+            if value:
+                return str(value).strip()
+        except Exception:
+            pass
+    message_obj = getattr(event, "message_obj", None)
+    for attr in ("self_id", "bot_id"):
+        value = getattr(message_obj, attr, None)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _extract_at_target_id(component: Any) -> str:
+    for attr in ("qq", "user_id", "target", "id", "uin"):
+        value = getattr(component, attr, None)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _has_leading_cq_at(text: str, self_id: str) -> bool:
+    if not self_id:
+        return False
+    cq_at_re = re.compile(rf"^\[CQ:at,[^\]]*\bqq={re.escape(self_id)}(?:[,\]])", re.IGNORECASE)
+    current = str(text or "").lstrip()
+    while current:
+        match = _LEADING_REPLY_OR_AT_TAG_RE.match(current)
+        if not match:
+            break
+        tag = match.group(0).strip()
+        if cq_at_re.match(tag):
+            return True
+        current = current[match.end():].lstrip()
+    return False
+
+
+def _event_has_leading_bot_mention(event: AstrMessageEvent) -> bool:
+    self_id = _extract_event_self_id(event)
+    if not self_id:
+        return False
+    message_obj = getattr(event, "message_obj", None)
+    components = getattr(message_obj, "message", None) or ()
+    for component in components:
+        if isinstance(component, At) or type(component).__name__ == "At":
+            if _extract_at_target_id(component) == self_id:
+                return True
+            continue
+        if isinstance(component, Plain) or type(component).__name__ in {"Plain", "Text"}:
+            raw_text = getattr(component, "text", None)
+            if raw_text is None:
+                raw_text = getattr(component, "message", "")
+            raw_str = str(raw_text or "")
+            if _has_leading_cq_at(raw_str, self_id):
+                return True
+            if _strip_leading_reply_or_at_tags(raw_str):
+                return False
+    original = getattr(message_obj, "message_str", None)
+    return isinstance(original, str) and _has_leading_cq_at(original, self_id)
+
+
 def _event_allows_compact_draw(event: AstrMessageEvent, cfg: Any) -> bool:
     is_wake_cmd = getattr(event, "is_at_or_wake_command", False)
     if callable(is_wake_cmd):
@@ -223,6 +288,9 @@ def _event_allows_compact_draw(event: AstrMessageEvent, cfg: Any) -> bool:
             is_wake_cmd = False
     if not is_wake_cmd:
         return False
+
+    if _event_has_leading_bot_mention(event):
+        return True
 
     wake_prefixes = _extract_wake_prefixes(cfg)
     non_empty_prefixes = [prefix for prefix in wake_prefixes if prefix]
@@ -254,7 +322,7 @@ _CustomFilterBase = getattr(filter, "CustomFilter", object)
 
 
 class _CompactDrawCommandFilter(_CustomFilterBase):
-    """Match compact `画<提示词>` only when invoked with an explicit wake prefix (or bare wake config)."""
+    """Match compact `画<提示词>` on explicit wake prefix, leading `@bot`, or bare wake config."""
 
     def __init__(self, raise_error: bool = True, **kwargs: Any) -> None:
         if _CustomFilterBase is not object:

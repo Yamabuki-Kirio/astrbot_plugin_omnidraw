@@ -3380,6 +3380,113 @@ class CompactDrawCommandTest(unittest.IsolatedAsyncioTestCase):
                 {"wake_prefix": [""]},
             )
         )
+        self.assertTrue(
+            flt.filter(
+                self._event(
+                    "画一个人",
+                    "画一个人",
+                    components=[main_module.At("999"), main_module.Plain("画一个人")],
+                    is_at_or_wake=True,
+                ),
+                cfg,
+            )
+        )
+        self.assertTrue(
+            flt.filter(
+                self._event(
+                    "画一个人",
+                    "画一个人",
+                    components=[types.SimpleNamespace(id="1"), main_module.At("999"), main_module.Plain("画一个人")],
+                    is_at_or_wake=True,
+                ),
+                cfg,
+            )
+        )
+        self.assertTrue(
+            flt.filter(
+                self._event(
+                    "画一个人",
+                    "[CQ:at,qq=999] 画一个人",
+                    is_at_or_wake=True,
+                ),
+                cfg,
+            )
+        )
+        self.assertFalse(
+            flt.filter(
+                self._event(
+                    "画风真好看 @Bot(999)",
+                    "画风真好看 @Bot(999)",
+                    components=[main_module.Plain("画风真好看 "), main_module.At("999")],
+                    is_at_or_wake=True,
+                ),
+                cfg,
+            )
+        )
+        self.assertFalse(
+            flt.filter(
+                self._event(
+                    "画一个人",
+                    "@甲(123) 画一个人",
+                    components=[main_module.At("123"), main_module.Plain("画一个人")],
+                    is_at_or_wake=True,
+                ),
+                cfg,
+            )
+        )
+
+    async def test_compact_draw_via_leading_bot_mention_binds_other_avatars(self):
+        plugin = self._plugin()
+        calls = []
+        original_client_session = main_module.aiohttp.ClientSession
+        original_chain_manager = main_module.ChainManager
+
+        class FakeChainManager:
+            def __init__(self, config, session):
+                pass
+
+            async def run_chain_with_metadata(self, chain_name, prompt, **kwargs):
+                calls.append((chain_name, prompt, kwargs))
+                return ChainRunResult(
+                    image_url="https://cdn.example.com/at-bot.png",
+                    provider_id="node_1",
+                    model="model_a",
+                    elapsed_seconds=1.0,
+                )
+
+        actor = main_module.At("123")
+        actor.name = "甲"
+        target = main_module.At("456")
+        target.name = "乙"
+        event = self._attach_event_methods(
+            self._event(
+                "画让 @甲(123) 推倒 @乙(456)",
+                "画让 @甲(123) 推倒 @乙(456)",
+                components=[main_module.At("999"), main_module.Plain("画让"), actor, main_module.Plain("推倒"), target],
+            )
+        )
+        main_module.aiohttp.ClientSession = FakeClientSession
+        main_module.ChainManager = FakeChainManager
+        try:
+            _ = [item async for item in plugin.cmd_draw_compact(event)]
+        finally:
+            main_module.aiohttp.ClientSession = original_client_session
+            main_module.ChainManager = original_chain_manager
+
+        self.assertTrue(event.stopped)
+        self.assertEqual(len(calls), 1)
+        prompt, kwargs = calls[0][1], calls[0][2]
+        self.assertIn("让 【人物1】 推倒 【人物2】", prompt)
+        self.assertIn("【人物1】=甲（QQ 123），外观使用第 1 张参考图。", prompt)
+        self.assertIn("【人物2】=乙（QQ 456），外观使用第 2 张参考图。", prompt)
+        self.assertNotIn("999", prompt)
+        self.assertEqual(
+            kwargs["user_refs"],
+            [
+                f"saved:{plugin._build_qq_avatar_url('123')}",
+                f"saved:{plugin._build_qq_avatar_url('456')}",
+            ],
+        )
 
     async def test_compact_draw_runs_generation_with_params_and_stops_event(self):
         plugin = self._plugin()
