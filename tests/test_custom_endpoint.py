@@ -74,6 +74,10 @@ class _Filter:
     class PermissionType:
         ADMIN = "admin"
 
+    class CustomFilter:
+        def __init__(self, raise_error=True, **kwargs):
+            self.raise_error = raise_error
+
     def command(self, *args, **kwargs):
         return lambda func: func
 
@@ -81,6 +85,12 @@ class _Filter:
         return lambda func: func
 
     def event_message_type(self, *args, **kwargs):
+        return lambda func: func
+
+    def custom_filter(self, *args, **kwargs):
+        return lambda func: func
+
+    def regex(self, *args, **kwargs):
         return lambda func: func
 
 
@@ -3263,6 +3273,293 @@ class ReliabilityBoundaryRegressionTest(unittest.IsolatedAsyncioTestCase):
             ["https://public.example/ref.png", "http://127.0.0.1/private.png"],
         )
         self.assertEqual(len(session.gets), 1)
+
+
+class CompactDrawCommandTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def _plugin(self, presets=None):
+        plugin = object.__new__(OmniDrawPlugin)
+        plugin.data_dir = self.temp.name
+        plugin.plugin_config = types.SimpleNamespace(
+            presets=dict(presets or {}),
+            draw_pending_message="正在生成 {command}: {prompt} 参数{param_count}",
+            draw_error_message="绘制失败: {error}",
+            persona_name="默认助理",
+            verbose_report=False,
+        )
+        plugin.cmd_parser = main_module.CommandParser()
+        plugin._configured_astrbot_command_prefixes = lambda: ["/"]
+        plugin._permission_denied_message = lambda event: ""
+        plugin._reserve_image_quota = lambda event, count=1: ("", count)
+        plugin._complete_image_quota = lambda event, reserved, count: setattr(plugin, "_recorded_count", count)
+        plugin._released = []
+        plugin._release_image_quota = lambda event, count: plugin._released.append(count)
+        plugin._recorded_count = 0
+        plugin._lease_cache_paths = lambda paths: list(paths or [])
+        plugin._release_cache_paths = lambda paths: None
+        plugin._build_image_success_components = lambda result, elapsed: [{"result": result.image_url}]
+
+        async def _save_refs(refs, session=None):
+            return [f"saved:{ref}" for ref in refs]
+
+        plugin._process_and_save_images = _save_refs
+        return plugin
+
+    def _event(self, message_str, raw_message_str=None, components=None, is_at_or_wake=True, extras=None):
+        if raw_message_str is None:
+            raw_message_str = message_str
+        msg_obj = types.SimpleNamespace(
+            message_str=raw_message_str,
+            message=list(components or []),
+            message_id="msg-compact",
+        )
+        extra_map = dict(extras or {})
+        return types.SimpleNamespace(
+            message_str=message_str,
+            message_obj=msg_obj,
+            is_at_or_wake_command=is_at_or_wake,
+            get_self_id=lambda: "999",
+            get_extra=lambda key, default=None: extra_map.get(key, default),
+            plain_result=lambda text: ("plain", text),
+            chain_result=lambda chain: ("chain", chain),
+            sent=[],
+            stopped=False,
+            stop_event=lambda: None,
+        )
+
+    def _attach_event_methods(self, event):
+        async def _send(result):
+            event.sent.append(result)
+
+        def _stop():
+            event.stopped = True
+
+        event.send = _send
+        event.stop_event = _stop
+        return event
+
+    def test_compact_draw_filter_requires_wake_prefix_when_configured(self):
+        flt = main_module._CompactDrawCommandFilter()
+        cfg = {"wake_prefix": ["/"]}
+
+        self.assertTrue(flt.filter(self._event("画一只猫", "/画一只猫"), cfg))
+        self.assertTrue(flt.filter(self._event("画一只猫", "[CQ:reply,id=1] /画一只猫"), cfg))
+        self.assertTrue(
+            flt.filter(
+                self._event(
+                    "画一只猫",
+                    "回复张三: 某消息",
+                    components=[types.SimpleNamespace(id="1"), main_module.Plain("/画一只猫")],
+                ),
+                cfg,
+            )
+        )
+        self.assertTrue(
+            flt.filter(self._event("画一只猫", "#画一只猫"), {"wake_prefix": ["#"]})
+        )
+        self.assertFalse(
+            flt.filter(
+                self._event(
+                    "画风真好看",
+                    "画风真好看",
+                    components=[main_module.Plain("画风真好看")],
+                    is_at_or_wake=True,
+                ),
+                cfg,
+            )
+        )
+        self.assertFalse(
+            flt.filter(self._event("画风真好看", "画风真好看", is_at_or_wake=False), cfg)
+        )
+        self.assertTrue(
+            flt.filter(
+                self._event("画一只猫", "画一只猫", is_at_or_wake=True),
+                {"wake_prefix": [""]},
+            )
+        )
+
+    async def test_compact_draw_runs_generation_with_params_and_stops_event(self):
+        plugin = self._plugin()
+        calls = []
+        original_client_session = main_module.aiohttp.ClientSession
+        original_chain_manager = main_module.ChainManager
+
+        class FakeChainManager:
+            def __init__(self, config, session):
+                pass
+
+            async def run_chain_with_metadata(self, chain_name, prompt, **kwargs):
+                calls.append((chain_name, prompt, kwargs))
+                return ChainRunResult(
+                    image_url="https://cdn.example.com/compact.png",
+                    provider_id="node_1",
+                    model=kwargs.get("model", "model_a"),
+                    elapsed_seconds=1.0,
+                )
+
+        event = self._attach_event_methods(
+            self._event("画一只猫 --model test-model", "/画一只猫 --model test-model")
+        )
+        main_module.aiohttp.ClientSession = FakeClientSession
+        main_module.ChainManager = FakeChainManager
+        try:
+            results = [item async for item in plugin.cmd_draw_compact(event)]
+        finally:
+            main_module.aiohttp.ClientSession = original_client_session
+            main_module.ChainManager = original_chain_manager
+
+        self.assertTrue(event.stopped)
+        self.assertEqual(calls, [("text2img", "一只猫", {"model": "test-model"})])
+        self.assertEqual(results, [("chain", [{"result": "https://cdn.example.com/compact.png"}])])
+        self.assertEqual(plugin._recorded_count, 1)
+
+    async def test_compact_draw_preserves_repeated_draw_character_and_image_only_params(self):
+        plugin = self._plugin()
+        calls = []
+        original_client_session = main_module.aiohttp.ClientSession
+        original_chain_manager = main_module.ChainManager
+
+        class FakeChainManager:
+            def __init__(self, config, session):
+                pass
+
+            async def run_chain_with_metadata(self, chain_name, prompt, **kwargs):
+                calls.append((chain_name, prompt, kwargs))
+                return ChainRunResult(
+                    image_url="https://cdn.example.com/compact2.png",
+                    provider_id="node_1",
+                    model="model_a",
+                    elapsed_seconds=1.0,
+                )
+
+        main_module.aiohttp.ClientSession = FakeClientSession
+        main_module.ChainManager = FakeChainManager
+        try:
+            event_repeat = self._attach_event_methods(self._event("画画一只猫", "/画画一只猫"))
+            _ = [item async for item in plugin.cmd_draw_compact(event_repeat)]
+
+            ImageComp = type("Image", (), {})
+            img_obj = ImageComp()
+            img_obj.path = ""
+            img_obj.url = "https://example.com/ref.png"
+            event_param = self._attach_event_methods(
+                self._event("画--size 1024x1024", "/画--size 1024x1024", components=[img_obj])
+            )
+            _ = [item async for item in plugin.cmd_draw_compact(event_param)]
+        finally:
+            main_module.aiohttp.ClientSession = original_client_session
+            main_module.ChainManager = original_chain_manager
+
+        self.assertEqual(calls[0], ("text2img", "画一只猫", {}))
+        self.assertEqual(calls[1][0], "text2img")
+        self.assertIn("根据参考图生成", calls[1][1])
+        self.assertEqual(
+            calls[1][2],
+            {"size": "1024x1024", "user_refs": ["saved:https://example.com/ref.png"]},
+        )
+
+    async def test_compact_draw_binds_at_avatars(self):
+        plugin = self._plugin()
+        calls = []
+        original_client_session = main_module.aiohttp.ClientSession
+        original_chain_manager = main_module.ChainManager
+
+        class FakeChainManager:
+            def __init__(self, config, session):
+                pass
+
+            async def run_chain_with_metadata(self, chain_name, prompt, **kwargs):
+                calls.append((chain_name, prompt, kwargs))
+                return ChainRunResult(
+                    image_url="https://cdn.example.com/avatar.png",
+                    provider_id="node_1",
+                    model="model_a",
+                    elapsed_seconds=1.0,
+                )
+
+        actor = main_module.At("123")
+        actor.name = "甲"
+        target = main_module.At("456")
+        target.name = "乙"
+        event = self._attach_event_methods(
+            self._event(
+                "画让 @甲(123) 推倒 @乙(456)",
+                "/画让 @甲(123) 推倒 @乙(456)",
+                components=[main_module.Plain("/画让"), actor, main_module.Plain("推倒"), target],
+            )
+        )
+        main_module.aiohttp.ClientSession = FakeClientSession
+        main_module.ChainManager = FakeChainManager
+        try:
+            _ = [item async for item in plugin.cmd_draw_compact(event)]
+        finally:
+            main_module.aiohttp.ClientSession = original_client_session
+            main_module.ChainManager = original_chain_manager
+
+        self.assertEqual(len(calls), 1)
+        prompt, kwargs = calls[0][1], calls[0][2]
+        self.assertIn("让 【人物1】 推倒 【人物2】", prompt)
+        self.assertIn("【人物1】=甲（QQ 123），外观使用第 1 张参考图。", prompt)
+        self.assertIn("【人物2】=乙（QQ 456），外观使用第 2 张参考图。", prompt)
+        self.assertEqual(
+            kwargs["user_refs"],
+            [
+                f"saved:{plugin._build_qq_avatar_url('123')}",
+                f"saved:{plugin._build_qq_avatar_url('456')}",
+            ],
+        )
+
+    async def test_compact_draw_yields_to_other_commands_and_presets(self):
+        plugin = self._plugin(presets={"画风测试": "watercolor style"})
+
+        CommandFilter = type("CommandFilter", (), {})
+        other_handler = types.SimpleNamespace(
+            handler_name="cmd_workflow",
+            event_filters=[CommandFilter()],
+        )
+        event_other_parsed = self._attach_event_methods(
+            self._event(
+                "画图工作流",
+                "/画图工作流",
+                extras={"handlers_parsed_params": {"other_cmd_workflow": {}}},
+            )
+        )
+        self.assertEqual([item async for item in plugin.cmd_draw_compact(event_other_parsed)], [])
+        self.assertFalse(event_other_parsed.stopped)
+
+        event_other_activated = self._attach_event_methods(
+            self._event(
+                "画图工作流",
+                "/画图工作流",
+                extras={"activated_handlers": [other_handler]},
+            )
+        )
+        self.assertEqual([item async for item in plugin.cmd_draw_compact(event_other_activated)], [])
+        self.assertFalse(event_other_activated.stopped)
+
+        event_preset = self._attach_event_methods(self._event("画风测试", "/画风测试"))
+        self.assertEqual([item async for item in plugin.cmd_draw_compact(event_preset)], [])
+        self.assertFalse(event_preset.stopped)
+
+    def test_compact_draw_error_message_and_decorator_ast(self):
+        plugin = self._plugin()
+        self.assertEqual(
+            plugin._build_command_error_message("cmd_draw_compact", RuntimeError("boom")),
+            "绘制失败: boom",
+        )
+
+        tree = ast.parse(Path(main_module.__file__).read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        decorators = [ast.unparse(item) for item in functions["cmd_draw_compact"].decorator_list]
+        self.assertIn("filter.custom_filter(_CompactDrawCommandFilter)", decorators)
+        self.assertIn("filter.regex('^画\\\\S', priority=-1)", decorators)
 
 
 if __name__ == "__main__":

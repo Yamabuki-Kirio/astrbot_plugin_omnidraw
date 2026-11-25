@@ -173,6 +173,98 @@ CONFIG_KEYS = {
     "persona_ref_images",
 }
 
+_LEADING_REPLY_OR_AT_TAG_RE = re.compile(
+    r"^\s*(?:(?:\[CQ:(?:reply|at),[^\]]*\])|(?:\[(?:引用|回复)[^\]]*\]))\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_reply_or_at_tags(text: str) -> str:
+    current = str(text or "").lstrip()
+    while current:
+        cleaned = _LEADING_REPLY_OR_AT_TAG_RE.sub("", current, count=1).lstrip()
+        if cleaned == current:
+            break
+        current = cleaned
+    return current
+
+
+def _extract_wake_prefixes(cfg: Any) -> List[str]:
+    raw_prefixes = None
+    if isinstance(cfg, dict):
+        raw_prefixes = cfg.get("wake_prefix")
+    elif cfg is not None:
+        getter = getattr(cfg, "get", None)
+        if callable(getter):
+            try:
+                raw_prefixes = getter("wake_prefix")
+            except TypeError:
+                raw_prefixes = None
+        if raw_prefixes is None:
+            try:
+                raw_prefixes = cfg["wake_prefix"]
+            except Exception:
+                raw_prefixes = None
+    if raw_prefixes is None:
+        return ["/"]
+    if isinstance(raw_prefixes, str):
+        return [raw_prefixes]
+    if isinstance(raw_prefixes, (list, tuple, set)):
+        return [str(item) for item in raw_prefixes if item is not None]
+    return [str(raw_prefixes)]
+
+
+def _event_allows_compact_draw(event: AstrMessageEvent, cfg: Any) -> bool:
+    is_wake_cmd = getattr(event, "is_at_or_wake_command", False)
+    if callable(is_wake_cmd):
+        try:
+            is_wake_cmd = is_wake_cmd()
+        except Exception:
+            is_wake_cmd = False
+    if not is_wake_cmd:
+        return False
+
+    wake_prefixes = _extract_wake_prefixes(cfg)
+    non_empty_prefixes = [prefix for prefix in wake_prefixes if prefix]
+    if "" in wake_prefixes or not non_empty_prefixes:
+        return True
+
+    message_obj = getattr(event, "message_obj", None)
+    original = getattr(message_obj, "message_str", None)
+    if isinstance(original, str):
+        stripped_original = _strip_leading_reply_or_at_tags(original)
+        if any(stripped_original.startswith(prefix) for prefix in non_empty_prefixes):
+            return True
+
+    components = getattr(message_obj, "message", None) or ()
+    for component in components:
+        if not (isinstance(component, Plain) or type(component).__name__ in {"Plain", "Text"}):
+            continue
+        raw_text = getattr(component, "text", None)
+        if raw_text is None:
+            raw_text = getattr(component, "message", "")
+        stripped_part = _strip_leading_reply_or_at_tags(str(raw_text or ""))
+        if not stripped_part:
+            continue
+        return any(stripped_part.startswith(prefix) for prefix in non_empty_prefixes)
+    return False
+
+
+_CustomFilterBase = getattr(filter, "CustomFilter", object)
+
+
+class _CompactDrawCommandFilter(_CustomFilterBase):
+    """Match compact `画<提示词>` only when invoked with an explicit wake prefix (or bare wake config)."""
+
+    def __init__(self, raise_error: bool = True, **kwargs: Any) -> None:
+        if _CustomFilterBase is not object:
+            super().__init__(raise_error=raise_error, **kwargs)
+        else:
+            self.raise_error = raise_error
+
+    def filter(self, event: AstrMessageEvent, cfg: Any) -> bool:
+        return _event_allows_compact_draw(event, cfg)
+
 
 @register(PLUGIN_NAME, PLUGIN_AUTHOR, f"万象画卷 v{PLUGIN_VERSION}", PLUGIN_VERSION)
 class OmniDrawPlugin(Star):
@@ -1754,13 +1846,14 @@ class OmniDrawPlugin(Star):
                 return prefix
         return ""
 
-    def _message_component_has_command(self, obj: Any, command: str) -> bool:
+    def _message_component_has_command(self, obj: Any, command: str, allow_compact: bool = False) -> bool:
         if not command or not (isinstance(obj, Plain) or type(obj).__name__ == "Plain"):
             return False
         text = str(getattr(obj, "text", "") or "")
         prefix_pattern = self._command_prefix_regex()
         prefix_part = rf"(?:{prefix_pattern})?" if prefix_pattern else ""
-        pattern = rf"(^|\s){prefix_part}{re.escape(command)}(?:\s|$)"
+        suffix_part = "" if allow_compact else r"(?:\s|$)"
+        pattern = rf"(^|\s){prefix_part}{re.escape(command)}{suffix_part}"
         return bool(re.search(pattern, text, flags=re.IGNORECASE))
 
     def _get_event_images(
@@ -1768,8 +1861,13 @@ class OmniDrawPlugin(Star):
         event: AstrMessageEvent,
         include_at_avatars: bool = False,
         at_after_command: str = "",
+        allow_compact_command: bool = False,
     ) -> List[str]:
-        images = list(self._avatar_mentions(event, at_after_command)) if include_at_avatars else []
+        images = (
+            list(self._avatar_mentions(event, at_after_command, allow_compact=allow_compact_command))
+            if include_at_avatars
+            else []
+        )
         visited = set()
 
         def _search(obj: Any) -> None:
@@ -1820,7 +1918,7 @@ class OmniDrawPlugin(Star):
         seen = set()
         return [item for item in images if not (item in seen or seen.add(item))]
 
-    def _avatar_mentions(self, event, command="", parts=None):
+    def _avatar_mentions(self, event, command="", parts=None, allow_compact: bool = False):
         get_self_id = getattr(event, "get_self_id", None)
         try:
             self_id = str(get_self_id() or "") if callable(get_self_id) else ""
@@ -1830,7 +1928,7 @@ class OmniDrawPlugin(Star):
         active = not command
         for component in getattr(getattr(event, "message_obj", None), "message", None) or []:
             if isinstance(component, Plain) or type(component).__name__ == "Plain":
-                active = active or self._message_component_has_command(component, command)
+                active = active or self._message_component_has_command(component, command, allow_compact=allow_compact)
                 if parts is not None:
                     parts.append(str(getattr(component, "text", "")))
             elif active and (isinstance(component, At) or type(component).__name__ == "At"):
@@ -1845,14 +1943,14 @@ class OmniDrawPlugin(Star):
                         parts.append(f" 【人物{index}】 ")
         return mentions
 
-    def _mention_command_text(self, event, command):
+    def _mention_command_text(self, event, command, allow_compact: bool = False):
         parts = []
-        if self._avatar_mentions(event, command, parts):
+        if self._avatar_mentions(event, command, parts, allow_compact=allow_compact):
             return self._command_text_without_prefix("".join(parts), allow_bare=True)
         return ""
 
-    def _bind_avatar_prompt(self, event, prompt, raw_refs, safe_refs, command=""):
-        mentions = self._avatar_mentions(event, command)
+    def _bind_avatar_prompt(self, event, prompt, raw_refs, safe_refs, command="", allow_compact: bool = False):
+        mentions = self._avatar_mentions(event, command, allow_compact=allow_compact)
         if not mentions:
             return prompt
         if any(url not in raw_refs for url in mentions) or len(raw_refs) != len(safe_refs) or len(set(safe_refs)) != len(safe_refs):
@@ -2551,14 +2649,21 @@ class OmniDrawPlugin(Star):
             return plain_text
         return str(getattr(event, "message_obj", "") or "").strip()
 
-    def _extract_command_message(self, event: AstrMessageEvent, command: str, fallback: str = "") -> str:
-        return self._extract_command_message_any(event, (command,), fallback)
+    def _extract_command_message(
+        self,
+        event: AstrMessageEvent,
+        command: str,
+        fallback: str = "",
+        allow_compact: bool = False,
+    ) -> str:
+        return self._extract_command_message_any(event, (command,), fallback, allow_compact=allow_compact)
 
     def _extract_command_message_any(
         self,
         event: AstrMessageEvent,
         commands: Iterable[str],
         fallback: str = "",
+        allow_compact: bool = False,
     ) -> str:
         text = self._get_event_text(event)
         if not text:
@@ -2567,11 +2672,27 @@ class OmniDrawPlugin(Star):
         for command in sorted((str(item or "").strip() for item in commands), key=len, reverse=True):
             if not command:
                 continue
-            pattern = rf"^{re.escape(command)}(?:\s+(.*))?$"
+            pattern = rf"^{re.escape(command)}(?:\s*(.*))?$" if allow_compact else rf"^{re.escape(command)}(?:\s+(.*))?$"
             match = re.match(pattern, command_text, flags=re.S)
             if match:
                 return (match.group(1) or "").strip()
         return fallback.strip()
+
+    def _has_other_command_handler(self, event: AstrMessageEvent) -> bool:
+        get_extra = getattr(event, "get_extra", None)
+        if not callable(get_extra):
+            return False
+        parsed = get_extra("handlers_parsed_params", {}) or {}
+        if parsed:
+            return True
+        activated = get_extra("activated_handlers", []) or []
+        for handler in activated:
+            if getattr(handler, "handler_name", "") == "cmd_draw_compact":
+                continue
+            filters = getattr(handler, "event_filters", ()) or ()
+            if any(type(item).__name__ in {"CommandFilter", "CommandGroupFilter"} for item in filters):
+                return True
+        return False
 
     def _create_image_component(self, image_url: str) -> Image:
         if image_url.startswith("data:image"):
@@ -3048,8 +3169,8 @@ class OmniDrawPlugin(Star):
         )
         error_type = type(exc).__name__ if exc is not None else ""
 
-        if func_name in {"cmd_draw", "cmd_gif", "on_message_preset"}:
-            command = {"cmd_draw": "画", "cmd_gif": "gif"}.get(func_name, "宏指令")
+        if func_name in {"cmd_draw", "cmd_draw_compact", "cmd_gif", "on_message_preset"}:
+            command = {"cmd_draw": "画", "cmd_draw_compact": "画", "cmd_gif": "gif"}.get(func_name, "宏指令")
             return self._format_reply_message(
                 self.plugin_config.draw_error_message,
                 DEFAULT_DRAW_ERROR_MESSAGE,
@@ -3593,7 +3714,7 @@ class OmniDrawPlugin(Star):
 
         msg = (
             f"📖 万象画卷 v{PLUGIN_VERSION}\n"
-            f"{cmd('画')} [提示词] [--参数 值]\n"
+            f"{cmd('画')} [提示词] [--参数 值]（画与提示词间可省略空格）\n"
             f"{cmd('gif')} [动作描述] [--frame_count 9 --frame_duration_ms 200]\n"
             f"{cmd('自拍')} [动作] [--参数 值]\n"
             f"{cmd('视频')} [提示词] [--参数 值]\n"
@@ -4054,6 +4175,18 @@ class OmniDrawPlugin(Star):
         async for result in self._run_draw_command(event, "画", fallback):
             yield result
 
+    @filter.custom_filter(_CompactDrawCommandFilter)
+    @filter.regex(r"^画\S", priority=-1)
+    @handle_errors
+    async def cmd_draw_compact(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
+        if self._has_other_command_handler(event):
+            return
+        if self._parse_preset_trigger(self._get_event_text(event), allow_bare=True)[0]:
+            return
+        async for result in self._run_draw_command(event, "画", "", allow_compact=True):
+            yield result
+        self._stop_event_if_possible(event)
+
     @filter.command("gif")
     @handle_errors
     async def cmd_gif(
@@ -4078,7 +4211,7 @@ class OmniDrawPlugin(Star):
             yield result
 
     async def _run_draw_command(
-        self, event: AstrMessageEvent, command: str, fallback: str, use_gif: bool = False,
+        self, event: AstrMessageEvent, command: str, fallback: str, use_gif: bool = False, allow_compact: bool = False,
     ) -> AsyncGenerator[Any, None]:
         permission_error = self._permission_denied_message(event)
         if permission_error:
@@ -4089,11 +4222,17 @@ class OmniDrawPlugin(Star):
             yield event.plain_result(quota_error)
             return
 
-        message = self._extract_command_message(event, command, fallback)
-        mention_text = self._mention_command_text(event, command)
-        if mention_text.startswith(command + " "):
+        if allow_compact:
+            message = self._extract_command_message_any(event, (command,), fallback, allow_compact=True)
+        else:
+            message = self._extract_command_message(event, command, fallback)
+        mention_text = self._mention_command_text(event, command, allow_compact=allow_compact)
+        if mention_text.startswith(command + " ") or (allow_compact and mention_text.startswith(command)):
             message = mention_text[len(command):].strip()
-        raw_refs = await self._get_event_reference_images(event, include_at_avatars=True, at_after_command=command)
+        ref_kwargs: Dict[str, Any] = {"include_at_avatars": True, "at_after_command": command}
+        if allow_compact:
+            ref_kwargs["allow_compact_command"] = True
+        raw_refs = await self._get_event_reference_images(event, **ref_kwargs)
         if not message and not raw_refs:
             self._release_image_quota(event, reserved_count)
             yield event.plain_result(f"{MessageEmoji.WARNING} 请输入提示词或附带参考图。")
@@ -4116,7 +4255,9 @@ class OmniDrawPlugin(Star):
                         if is_gif_request(kwargs) else "根据参考图生成一张自然、清晰、符合原图语义的图片。"
                     )
                 prompt = self._bind_named_reference_prompt(prompt, named_bindings, raw_refs, safe_refs)
-                prompt = self._bind_avatar_prompt(event, prompt, raw_refs, safe_refs, command)
+                prompt = self._bind_avatar_prompt(
+                    event, prompt, raw_refs, safe_refs, command, allow_compact=allow_compact,
+                )
                 param_count = len(kwargs)
                 if safe_refs:
                     kwargs["user_refs"] = safe_refs
