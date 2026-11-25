@@ -8,6 +8,7 @@
     <title>万象画卷 · 插件配置</title>
     <link rel="icon" href="./logo.png" />
     <link rel="stylesheet" href="./assets/ui.css?v=3.4.3-scoped-ui" />
+    <link rel="stylesheet" href="./reference-terms.css?v=3.4.3-layout" />
 </head>
 <body class="bg-background text-gray-700 font-sans">
     <div class="app-shell">
@@ -464,7 +465,7 @@
                 <article class="card wide-card">
                     <div class="card-header space-between">
                         <div><h3>参考图词条</h3><p>查看聊天中保存的词条。删除后，该词条不再自动附带参考图。</p></div>
-                        <button id="reference-terms-refresh" class="btn-secondary" type="button">刷新</button>
+                        <button id="reference-terms-refresh" class="reference-button" type="button">刷新</button>
                     </div>
                     <p id="reference-terms-status" role="status"></p>
                     <div id="reference-terms-list" class="list-container"></div>
@@ -500,6 +501,6 @@
 
     <noscript><div class="noscript-banner">配置页需要启用 JavaScript 才能运行。</div></noscript>
     <script defer src="./assets/ui.js?v=3.4.3-scoped-ui"></script>
-    <script type="module" src="./app.js?v=3.4.3-reference-terms"></script>
+    <script type="module" src="./app.js?v=3.4.3-reference-layout"></script>
 </body>
 </html>

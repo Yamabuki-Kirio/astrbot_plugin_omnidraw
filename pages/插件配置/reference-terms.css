@@ -1,0 +1,39 @@
+#tab-reference-terms [hidden] { display: none !important; }
+#tab-reference-terms .card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+#tab-reference-terms h3 { font-size: 18px; font-weight: 650; }
+#tab-reference-terms .card-header p,
+#reference-terms-status { margin: 6px 0; color: #526075; font-size: 13px; }
+#reference-terms-list { display: grid; gap: 12px; margin-top: 12px; }
+#tab-reference-terms .reference-entry {
+    min-width: 0;
+    padding: 16px;
+    display: grid;
+    gap: 10px;
+    border: 1px solid #dce4ef;
+    border-radius: 12px;
+    background: #f8fafc;
+    color: #192437;
+}
+#tab-reference-terms .reference-entry h4 { font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
+#tab-reference-terms .reference-owner { color: #526075; font-size: 13px; overflow-wrap: anywhere; }
+#tab-reference-terms .reference-actions,
+#tab-reference-terms .reference-preview,
+#tab-reference-terms .reference-confirmation { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+#tab-reference-terms .reference-button {
+    padding: 6px 12px;
+    border: 1px solid #ccd6e4;
+    border-radius: 8px;
+    color: #234782;
+    background: #fff;
+    cursor: pointer;
+    white-space: nowrap;
+    font-size: 13px;
+}
+#tab-reference-terms .reference-button:hover:not(:disabled) { background: #edf4ff; }
+#tab-reference-terms .reference-button:disabled { opacity: .55; cursor: wait; }
+#tab-reference-terms .reference-button-danger { color: #a51d35; border-color: #edc0c8; }
+#tab-reference-terms .reference-confirmation { padding: 10px; border-radius: 8px; background: #fff0f2; }
+#tab-reference-terms .reference-confirmation p { flex-basis: 100%; color: #8e1d30; }
+#tab-reference-terms .reference-preview { padding: 12px; border-radius: 8px; background: #eaf0f7; }
+#tab-reference-terms .reference-image { display: block; width: 100%; height: min(45vh, 360px); object-fit: contain; }
+#tab-reference-terms .reference-entry > [role="status"]:empty { display: none; }

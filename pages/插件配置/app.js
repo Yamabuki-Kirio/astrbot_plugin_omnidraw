@@ -1312,7 +1312,7 @@ function setActiveTab(navItem) {
 function referenceTermButton(text, onClick, danger = false) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `btn-glass-secondary${danger ? " btn-danger" : ""}`;
+    button.className = `reference-button${danger ? " reference-button-danger" : ""}`;
     button.textContent = text;
     button.addEventListener("click", onClick);
     return button;
@@ -1320,10 +1320,11 @@ function referenceTermButton(text, onClick, danger = false) {
 
 function renderReferenceTerm(entry) {
     const row = document.createElement("article");
-    row.className = "card";
+    row.className = "reference-entry";
     const title = document.createElement("h4");
     title.textContent = `${entry.name} · ${entry.count} 张`;
     const owner = document.createElement("p");
+    owner.className = "reference-owner";
     try {
         const [origin, bot, sender] = JSON.parse(entry.scope);
         owner.textContent = `会话：${origin} ｜ Bot：${bot} ｜ ${sender === null ? "群共享" : `保存者：${sender}`}`;
@@ -1331,10 +1332,13 @@ function renderReferenceTerm(entry) {
         owner.textContent = entry.scope;
     }
     const actions = document.createElement("div");
+    actions.className = "reference-actions";
     const preview = document.createElement("div");
+    preview.className = "reference-preview";
     const status = document.createElement("p");
     status.setAttribute("role", "status");
     const confirmation = document.createElement("div");
+    confirmation.className = "reference-confirmation";
     confirmation.hidden = true;
     const key = { scope: entry.scope, name: entry.name };
     const previewButton = referenceTermButton("查看图片", () => {
@@ -1349,7 +1353,7 @@ function renderReferenceTerm(entry) {
                         if (!response?.success || !response.data_url?.startsWith("data:image/")) throw new Error(response?.message || "无法读取图片");
                         const image = document.createElement("img");
                         image.alt = `${entry.name} · 第 ${position + 1} 张参考图`;
-                        image.style.cssText = "display:block;max-width:100%;max-height:480px;margin-top:8px;object-fit:contain";
+                        image.className = "reference-image";
                         image.src = response.data_url;
                         preview.querySelector("img")?.remove();
                         preview.append(image);
@@ -1381,7 +1385,9 @@ function renderReferenceTerm(entry) {
             confirm.disabled = cancel.disabled = false;
         }
     }, true);
-    confirmation.append(`确定删除「${entry.name}」及其全部参考图？`, confirm, cancel);
+    const warning = document.createElement("p");
+    warning.textContent = `确定删除「${entry.name}」及其全部参考图？`;
+    confirmation.append(warning, confirm, cancel);
     actions.append(previewButton, deleteButton);
     row.append(title, owner, actions, confirmation, preview, status);
     return row;

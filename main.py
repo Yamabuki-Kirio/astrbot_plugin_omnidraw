@@ -2204,10 +2204,19 @@ class OmniDrawPlugin(Star):
     @staticmethod
     def _reference_catalog(library, scopes):
         catalog = {}
+        seen = set()
         for scope in scopes:
             for name in library.names(scope):
-                catalog.setdefault(name, scope)
+                folded = name.casefold()
+                if folded not in seen:
+                    catalog[name] = scope
+                    seen.add(folded)
         return catalog
+
+    @staticmethod
+    def _reference_catalog_name(catalog, name):
+        folded = str(name or "").casefold()
+        return next((stored for stored in catalog if stored.casefold() == folded), None)
 
     @staticmethod
     def _reference_name(name):
@@ -2232,7 +2241,8 @@ class OmniDrawPlugin(Star):
         if name is None:
             names = match_reference_names(prompt, catalog)
         else:
-            names = [self._reference_name(name)]
+            requested = self._reference_name(name)
+            names = [self._reference_catalog_name(catalog, requested) or requested]
         saved = []
         matched_images = []
         for matched in names:
@@ -2261,16 +2271,18 @@ class OmniDrawPlugin(Star):
         if len(raw_refs) != len(safe_refs) or len(set(safe_refs)) != len(safe_refs):
             raise ValueError("参考图词条未能完整绑定，请检查图片或减少参考图后重试。")
 
-        labels = {name: f"【参考主体{index}】" for index, (name, _) in enumerate(bindings, 1)}
+        labels = {name.casefold(): f"【参考主体{index}】" for index, (name, _) in enumerate(bindings, 1)}
         patterns = []
-        for name in sorted(labels, key=lambda item: (-len(item), item)):
+        for name, _ in sorted(bindings, key=lambda item: (-len(item[0]), item[0].casefold(), item[0])):
             escaped = re.escape(name)
             if name[0].isascii():
                 escaped = r"(?<![A-Za-z0-9_])" + escaped
             if name[-1].isascii():
                 escaped += r"(?![A-Za-z0-9_])"
             patterns.append(escaped)
-        rewritten = re.sub("|".join(patterns), lambda match: labels[match.group()], prompt)
+        rewritten = re.sub(
+            "|".join(patterns), lambda match: labels[match.group().casefold()], prompt, flags=re.IGNORECASE,
+        )
 
         lines = []
         for index, (name, positions) in enumerate(bindings, 1):
@@ -4009,7 +4021,8 @@ class OmniDrawPlugin(Star):
                 message = "当前会话可用词条：" + "、".join(catalog) if catalog else "当前会话没有可用的参考词条。"
             elif action == "输出参考图":
                 catalog = await asyncio.to_thread(self._reference_catalog, library, (scope,))
-                names = [self._reference_name(name)] if name else list(catalog)
+                requested = self._reference_name(name) if name else ""
+                names = [self._reference_catalog_name(catalog, requested) or requested] if requested else list(catalog)
                 if not names:
                     raise ValueError("当前会话没有可用的参考词条。")
                 for term in names:
@@ -4028,8 +4041,9 @@ class OmniDrawPlugin(Star):
             elif action == "删除":
                 name = self._reference_name(name)
                 catalog = await asyncio.to_thread(self._reference_catalog, library, scopes)
-                term_scope = catalog.get(name)
-                removed = await asyncio.to_thread(library.delete, term_scope, name) if term_scope else False
+                stored_name = self._reference_catalog_name(catalog, name)
+                term_scope = catalog.get(stored_name) if stored_name else None
+                removed = await asyncio.to_thread(library.delete, term_scope, stored_name) if term_scope else False
                 message = f"已删除参考词条：{name}" if removed else f"未找到参考词条：{name}"
             else:
                 if action != "保存" and name:

@@ -1,5 +1,7 @@
 import importlib
 import io
+import sqlite3
+from contextlib import closing
 import tempfile
 import types
 import unittest
@@ -12,6 +14,29 @@ main = importlib.import_module(f"{fixtures.PACKAGE_NAME}.main")
 
 
 class ReferenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_duplicates_are_hidden_from_lookup_and_preview(self):
+        with tempfile.TemporaryDirectory() as root:
+            library = main.ReferenceLibrary(root)
+            library.save("group", "塔菲", [("image/gif", b"gif")] * 2)
+            with closing(sqlite3.connect(library.path)) as connection, connection:
+                connection.execute("INSERT INTO refs VALUES (?, ?, ?, ?, ?)", ("group", "塔菲", 1, "image/gif", b"gif"))
+            self.assertEqual(library.entries()[0]["count"], 1)
+            self.assertEqual(library.images("group", "塔菲"), [("image/gif", b"gif")])
+            self.assertIsNone(library.preview("group", "塔菲", 1))
+
+    async def test_openai_edit_skips_uniform_gif_lead_in(self):
+        from PIL import Image
+
+        provider = importlib.import_module(f"{fixtures.PACKAGE_NAME}.providers.openai_impl")
+        output = io.BytesIO()
+        visible = Image.new("RGB", (8, 8), "white")
+        visible.putpixel((0, 0), (255, 0, 0))
+        Image.new("RGB", (8, 8), "white").save(output, "GIF", save_all=True, append_images=[visible])
+        [(payload, mime)] = provider.prepare_edit_references([(output.getvalue(), "image/gif")])
+        self.assertEqual(mime, "image/png")
+        with Image.open(io.BytesIO(payload)) as still:
+            self.assertEqual(still.getpixel((0, 0)), (255, 0, 0, 255))
+
     async def test_openai_edit_gif_reference_uses_first_frame(self):
         from PIL import Image
 
@@ -93,6 +118,34 @@ class ReferenceTests(unittest.IsolatedAsyncioTestCase):
             )
             event.get_sender_id = lambda: "other"
             self.assertEqual(await plugin._add_named_references(event, ["current.png"], {}, "塔菲"), ["current.png"])
+
+    async def test_ascii_reference_terms_are_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as root:
+            plugin = main.OmniDrawPlugin.__new__(main.OmniDrawPlugin)
+            plugin.data_dir = root
+            event = types.SimpleNamespace(
+                unified_msg_origin="qq:GroupMessage:123", get_self_id=lambda: "999", get_sender_id=lambda: "456",
+            )
+            library = main.ReferenceLibrary(root)
+            scope = plugin._reference_scope(event)
+            library.save(scope, "Caroline", [("image/png", b"first")])
+
+            for spelling in ("Caroline", "caroline", "CAROLINE", "CaRoLiNe"):
+                with self.subTest(spelling=spelling):
+                    raw_refs, bindings = await plugin._add_named_references(
+                        event, [], {}, f"{spelling} pushes Justine", return_bindings=True,
+                    )
+                    self.assertEqual(raw_refs, ["data:image/png;base64,Zmlyc3Q="])
+                    self.assertEqual(bindings, [("Caroline", [1])])
+                    prompt = plugin._bind_named_reference_prompt(
+                        f"{spelling} pushes Justine", bindings, raw_refs, ["caroline.png"],
+                    )
+                    self.assertIn("【参考主体1】 pushes Justine", prompt)
+                    self.assertIn("词条「Caroline」", prompt)
+
+            library.save(scope, "caroline", [("image/png", b"replacement")])
+            self.assertEqual(library.names(scope), ["caroline"])
+            self.assertEqual(library.load(scope, "caroline"), ["data:image/png;base64,cmVwbGFjZW1lbnQ="])
 
     async def test_named_references_bind_actor_and_target_to_image_order(self):
         with tempfile.TemporaryDirectory() as root:

@@ -34,8 +34,27 @@ def prepare_edit_references(refs):
                 with Image.open(io.BytesIO(payload)) as image:
                     if image.width * image.height > 24_000_000:
                         raise ValueError("GIF 像素过大")
+                    still = image.convert("RGBA")
+                    frame_limit = min(32, max(1, 24_000_000 // (image.width * image.height)))
+                    for frame_index in range(frame_limit):
+                        try:
+                            image.seek(frame_index)
+                        except EOFError:
+                            break
+                        candidate = image.convert("RGBA")
+                        visible = candidate.getbbox()
+                        if not visible:
+                            continue
+                        extrema = candidate.crop(visible).convert("RGB").getextrema()
+                        if still.getbbox() is None:
+                            still = candidate
+                        if any(low != high for low, high in extrema):
+                            still = candidate
+                            break
+                    if still.getbbox() is None:
+                        raise ValueError("未找到可见画面")
                     output = io.BytesIO()
-                    image.convert("RGBA").save(output, format="PNG")
+                    still.save(output, format="PNG")
                     payload = output.getvalue()
                 mime_type = "image/png"
             except (OSError, ValueError, Image.DecompressionBombError) as exc:
